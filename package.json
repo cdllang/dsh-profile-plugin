@@ -1,0 +1,14 @@
+{
+  "name": "dsh-profile-plugin",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness 个人主页插件 - 显示使用统计、Token 活动热力图、会话数据等",
+  "keywords": ["deepseek-harness", "dsh", "plugin", "profile", "dashboard"],
+  "license": "MIT",
+  "author": "",
+  "dsh": {
+    "client": {
+      "inject": ["slots"]
+    }
+  },
+  "files": ["src/"]
+}

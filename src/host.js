@@ -7,9 +7,15 @@ module.exports = {
   apply(ctx) {
     var profileStore = { name: 'delang chen', handle: '@cdllang', tier: 'Plus', avatar: null };
 
-    // 60 秒缓存，避免每次打开都重算（readSession 慢）
-    var statsCache = null, statsCacheTime = 0;
-    var CACHE_TTL = 60000;
+    // 事件驱动的缓存：任何会话活动（新消息、工具调用等）立即失效缓存，
+    // 无活动时缓存永远命中（秒回）；并发请求共享一次计算（Promise 去重）
+    var statsCache = null;
+    var statsInflight = null;
+
+    // 会话有新事件 → 数据变了 → 失效缓存
+    ctx.on('session/event', function() { statsCache = null; });
+    // 会话销毁 → 概览数变了 → 失效缓存
+    ctx.on('session/disposed', function() { statsCache = null; });
 
     function formatNum(n) {
       if (n === undefined || n === null) return '0';
@@ -144,13 +150,20 @@ module.exports = {
       };
     }
 
-    // 带缓存的 getStats
-    async function getStats() {
-      var nowMs = Date.now();
-      if (statsCache && nowMs - statsCacheTime < CACHE_TTL) return statsCache;
-      statsCache = await computeStats();
-      statsCacheTime = Date.now();
-      return statsCache;
+    // 带缓存的 getStats（事件驱动失效 + Promise 去重）
+    function getStats() {
+      if (statsCache) return Promise.resolve(statsCache);
+      if (!statsInflight) {
+        statsInflight = computeStats().then(function(result) {
+          statsCache = result;
+          statsInflight = null;
+          return result;
+        }, function(err) {
+          statsInflight = null;
+          throw err;
+        });
+      }
+      return statsInflight;
     }
 
     // 注册Web API路由（kind 必填，effect 返回 disposer）

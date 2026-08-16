@@ -7,6 +7,10 @@ module.exports = {
   apply(ctx) {
     var profileStore = { name: 'delang chen', handle: '@cdllang', tier: 'Plus', avatar: null };
 
+    // 60 秒缓存，避免每次打开都重算（readSession 慢）
+    var statsCache = null, statsCacheTime = 0;
+    var CACHE_TTL = 60000;
+
     function formatNum(n) {
       if (n === undefined || n === null) return '0';
       var num = typeof n === 'number' ? n : parseInt(n, 10);
@@ -16,7 +20,7 @@ module.exports = {
       return String(num);
     }
 
-    async function getStats() {
+    async function computeStats() {
       // 1. 获取所有会话（含持久化）
       var totalSessions = 0, sessionList = [];
       try { sessionList = ctx.sessionQuery ? await ctx.sessionQuery.listSessions() : []; totalSessions = sessionList.length; } catch (e) {}
@@ -26,34 +30,21 @@ module.exports = {
       try { workspaces = ctx.workspaceRegistry ? ctx.workspaceRegistry.list().length : 0; } catch (e) {}
       try { var graph = ctx.clientModules ? ctx.clientModules.graph() : null; if (graph && graph.entries) webPluginCount = graph.entries.length; } catch (e) {}
 
-      // 2. 遍历所有会话（live 用内存 events，persisted 用 readSession 读事件）
-      //    累加 assistant/message 的 usage（真实 token），按事件时间分布
+      // 2. Token 统计
+      //    活跃会话：内存 events + assistant/message usage 精确统计（快）
+      //    持久化会话：listEvents 轻量读取（时间分布），按全局平均每事件 token 估算
       var totalTokens = 0, maxSessionTokens = 0, tokenMap = {};
 
+      // 2a. 活跃会话精确统计
+      var liveEventsTotal = 0, liveTokensTotal = 0;
       for (var i = 0; i < sessionList.length; i++) {
         var rec = sessionList[i];
-        var id = rec && rec.header ? rec.header.id : null;
-        if (!id) continue;
+        if (!rec || !rec.header || !rec.live) continue;
+        var live = ctx.sessions ? ctx.sessions.get(rec.header.id) : null;
+        if (!live || !live.events || live.events.length === 0) continue;
 
-        var events = null;
-        try {
-          // live 会话直接取内存 events
-          if (rec.live) {
-            var live = ctx.sessions ? ctx.sessions.get(id) : null;
-            if (live && live.events && live.events.length > 0) events = live.events;
-          }
-          // persisted 会话用 readSession 读完整日志
-          if ((events === null || events.length === 0) && ctx.sessionQuery) {
-            try {
-              var snap = await ctx.sessionQuery.readSession(id);
-              if (snap && snap.events && snap.events.length > 0) events = snap.events;
-            } catch (e2) {}
-          }
-        } catch (e) {}
-
-        if (!events || events.length === 0) continue;
-
-        // 统计该会话的 token（从 assistant/message 的 usage 累加）
+        var events = live.events;
+        liveEventsTotal += events.length;
         var sessionTokens = 0;
         var dayCnt = {};
 
@@ -61,20 +52,17 @@ module.exports = {
           var ev = events[j];
           if (!ev) continue;
           var evTime = ev.time || 0;
-          var evTokens = 0;
-
-          // assistant/message 携带 usage：inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
           if (ev.type === 'assistant/message' && ev.data && ev.data.usage) {
             var u = ev.data.usage;
-            evTokens = (u.inputTokens || 0) + (u.outputTokens || 0) + (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0);
-          }
-
-          if (evTokens > 0) {
-            sessionTokens += evTokens;
-            if (evTime) {
-              var d = new Date(evTime); d.setHours(0, 0, 0, 0);
-              var k = d.getTime();
-              dayCnt[k] = (dayCnt[k] || 0) + evTokens;
+            var evTokens = (u.inputTokens || 0) + (u.outputTokens || 0) + (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0);
+            if (evTokens > 0) {
+              sessionTokens += evTokens;
+              liveTokensTotal += evTokens;
+              if (evTime) {
+                var d = new Date(evTime); d.setHours(0, 0, 0, 0);
+                var k = d.getTime();
+                dayCnt[k] = (dayCnt[k] || 0) + evTokens;
+              }
             }
           }
         }
@@ -82,11 +70,35 @@ module.exports = {
         if (sessionTokens > 0) {
           totalTokens += sessionTokens;
           if (sessionTokens > maxSessionTokens) maxSessionTokens = sessionTokens;
-          // 按事件时间分布 token（每个 usage 事件的 token 归属当天）
-          for (var k in dayCnt) {
-            tokenMap[k] = (tokenMap[k] || 0) + dayCnt[k];
-          }
+          for (var k in dayCnt) { tokenMap[k] = (tokenMap[k] || 0) + dayCnt[k]; }
         }
+      }
+
+      // 2b. 持久化会话：listEvents 轻量估算
+      var avgPerEvent = liveEventsTotal > 0 ? liveTokensTotal / liveEventsTotal : 0;
+      for (var i = 0; i < sessionList.length; i++) {
+        var rec = sessionList[i];
+        if (!rec || !rec.header || rec.live) continue;
+        try {
+          var evs = ctx.sessionQuery ? await ctx.sessionQuery.listEvents(rec.header.id) : null;
+          if (!evs || evs.length === 0) continue;
+          var dayCnt = {};
+          for (var j = 0; j < evs.length; j++) {
+            if (evs[j] && evs[j].time) {
+              var d = new Date(evs[j].time); d.setHours(0, 0, 0, 0);
+              var k = d.getTime();
+              dayCnt[k] = (dayCnt[k] || 0) + 1;
+            }
+          }
+          var estTokens = Math.round(evs.length * avgPerEvent);
+          if (estTokens > 0) {
+            totalTokens += estTokens;
+            if (estTokens > maxSessionTokens) maxSessionTokens = estTokens;
+            for (var k in dayCnt) {
+              tokenMap[k] = (tokenMap[k] || 0) + Math.round(estTokens * dayCnt[k] / evs.length);
+            }
+          }
+        } catch (e) {}
       }
 
       // 3. 构建 35 周热力图
@@ -130,6 +142,15 @@ module.exports = {
         tokenActivity: { months: mLabels, heatmapRows: rows, dayData: dayData, lastWeekDays: lastDays },
         overview: { workspaces: workspaces, sessions: totalSessions, plugins: webPluginCount, agents: liveAgents }
       };
+    }
+
+    // 带缓存的 getStats
+    async function getStats() {
+      var nowMs = Date.now();
+      if (statsCache && nowMs - statsCacheTime < CACHE_TTL) return statsCache;
+      statsCache = await computeStats();
+      statsCacheTime = Date.now();
+      return statsCache;
     }
 
     // 注册Web API路由（kind 必填，effect 返回 disposer）

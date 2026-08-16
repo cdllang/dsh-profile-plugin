@@ -1,11 +1,60 @@
 /**
  * DSH个人主页插件 - Host端
- * 注册Web API路由，提供用户统计数据
+ * 注册Web API路由，提供用户统计数据（profile 通过 settings 服务持久化）
  */
 module.exports = {
-  inject: ['sessions', 'workspaceRegistry', 'agents', 'sessionQuery', 'clientModules', 'sessionProjections', 'webServer'],
+  inject: ['sessions', 'workspaceRegistry', 'agents', 'sessionQuery', 'clientModules', 'sessionProjections', 'settings', 'webServer'],
   apply(ctx) {
+    var schema = require('@deepseek-ai/schemastery');
+
+    // 通过 settings 服务持久化用户资料（写入 ~/.dsh/settings.yaml，重启后保留）
+    var profileScope = null;
+    try {
+      if (ctx.settings) {
+        profileScope = ctx.settings.register('dshProfile', schema.object({
+          name: schema.string().default('delang chen'),
+          tier: schema.string().default('Plus'),
+          avatar: schema.string().default(''),
+        }));
+      }
+    } catch (e) {
+      console.error('dsh-profile: settings register failed:', e);
+    }
+
+    // 从持久化 settings 读取初始 profile
     var profileStore = { name: 'delang chen', handle: '@cdllang', tier: 'Plus', avatar: null };
+    try {
+      if (profileScope) {
+        var saved = profileScope.get();
+        if (saved) {
+          profileStore.name = saved.name || profileStore.name;
+          profileStore.tier = saved.tier || profileStore.tier;
+          profileStore.avatar = saved.avatar || null;
+        }
+      }
+    } catch (e) {
+      console.error('dsh-profile: settings read failed:', e);
+    }
+    profileStore.handle = '@' + profileStore.name.toLowerCase().replace(/\s+/g, '');
+
+    // 持久化保存函数
+    async function persistProfile(name, tier, avatar) {
+      if (name !== undefined && name !== null && name !== '') profileStore.name = name;
+      if (tier !== undefined && tier !== null && tier !== '') profileStore.tier = tier;
+      if (avatar !== undefined) profileStore.avatar = avatar || null;
+      profileStore.handle = '@' + profileStore.name.toLowerCase().replace(/\s+/g, '');
+      if (profileScope) {
+        try {
+          await profileScope.update({
+            name: profileStore.name,
+            tier: profileStore.tier,
+            avatar: profileStore.avatar || '',
+          });
+        } catch (e) {
+          console.error('dsh-profile: settings save failed:', e);
+        }
+      }
+    }
 
     // 事件驱动的缓存：任何会话活动（新消息、工具调用等）立即失效缓存，
     // 无活动时缓存永远命中（秒回）；并发请求共享一次计算（Promise 去重）
@@ -181,12 +230,10 @@ module.exports = {
         return web.register({ kind: 'exact', path: '/api/dsh-profile/save', handler: async function(req, res) {
           var body = '';
           req.on('data', function(chunk) { body += chunk; });
-          req.on('end', function() {
+          req.on('end', async function() {
             try {
               var args = JSON.parse(body);
-              profileStore.name = args.name || profileStore.name;
-              profileStore.avatar = args.avatar !== undefined ? args.avatar : profileStore.avatar;
-              profileStore.tier = args.tier || profileStore.tier;
+              await persistProfile(args.name, args.tier, args.avatar);
               res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
               res.end(JSON.stringify({ok:true}));
             } catch(e) {

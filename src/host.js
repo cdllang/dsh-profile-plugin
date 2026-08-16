@@ -88,7 +88,7 @@ module.exports = {
       // 2. Token 统计
       //    活跃会话：内存 events + assistant/message usage 精确统计（快）
       //    持久化会话：listEvents 轻量读取（时间分布），按全局平均每事件 token 估算
-      var totalTokens = 0, maxSessionTokens = 0, tokenMap = {};
+      var totalTokens = 0, tokenMap = {};
 
       // 2a. 活跃会话精确统计
       var liveEventsTotal = 0, liveTokensTotal = 0;
@@ -124,7 +124,6 @@ module.exports = {
 
         if (sessionTokens > 0) {
           totalTokens += sessionTokens;
-          if (sessionTokens > maxSessionTokens) maxSessionTokens = sessionTokens;
           for (var k in dayCnt) { tokenMap[k] = (tokenMap[k] || 0) + dayCnt[k]; }
         }
       }
@@ -148,12 +147,17 @@ module.exports = {
           var estTokens = Math.round(evs.length * avgPerEvent);
           if (estTokens > 0) {
             totalTokens += estTokens;
-            if (estTokens > maxSessionTokens) maxSessionTokens = estTokens;
             for (var k in dayCnt) {
               tokenMap[k] = (tokenMap[k] || 0) + Math.round(estTokens * dayCnt[k] / evs.length);
             }
           }
         } catch (e) {}
+      }
+
+      // 峰值 Token = 单日 token 最多的那一天
+      var maxDayTokens = 0;
+      for (var k in tokenMap) {
+        if (tokenMap[k] > maxDayTokens) maxDayTokens = tokenMap[k];
       }
 
       // 3. 构建 35 周热力图
@@ -193,7 +197,7 @@ module.exports = {
 
       return {
         profile: profileStore,
-        stats: { totalTokens: formatNum(totalTokens), peakTokens: formatNum(maxSessionTokens||totalTokens), longestChat: longest, currentStreak: curS+' 天', longestStreak: longS+' 天' },
+        stats: { totalTokens: formatNum(totalTokens), peakTokens: formatNum(maxDayTokens||totalTokens), longestChat: longest, currentStreak: curS+' 天', longestStreak: longS+' 天' },
         tokenActivity: { months: mLabels, heatmapRows: rows, dayData: dayData, lastWeekDays: lastDays },
         overview: { workspaces: workspaces, sessions: totalSessions, plugins: webPluginCount, agents: liveAgents }
       };

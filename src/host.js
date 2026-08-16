@@ -3,7 +3,7 @@
  * 注册Web API路由，提供用户统计数据（profile 通过 settings 服务持久化）
  */
 module.exports = {
-  inject: ['sessions', 'workspaceRegistry', 'agents', 'sessionQuery', 'clientModules', 'sessionProjections', 'settings', 'webServer'],
+  inject: ['sessions', 'sessionPersistence', 'workspaceRegistry', 'agents', 'sessionQuery', 'clientModules', 'sessionProjections', 'settings', 'webServer'],
   apply(ctx) {
     var schema = require('@deepseek-ai/schemastery');
 
@@ -85,24 +85,44 @@ module.exports = {
       try { workspaces = ctx.workspaceRegistry ? ctx.workspaceRegistry.list().length : 0; } catch (e) {}
       try { var graph = ctx.clientModules ? ctx.clientModules.graph() : null; if (graph && graph.entries) webPluginCount = graph.entries.length; } catch (e) {}
 
-      // 2. Token 统计
-      //    活跃会话：内存 events + assistant/message usage 精确统计（快）
-      //    持久化会话：listEvents 轻量读取（时间分布），按全局平均每事件 token 估算
+      // 2. Token 统计：所有会话都精确统计每个 assistant/message 事件的 usage
+      //    活跃会话：内存 events（快）
+      //    持久化会话：readFrom 读完整事件日志（无 replay validation，比 readSession 快），并行读取
       var totalTokens = 0, tokenMap = {};
 
-      // 2a. 活跃会话精确统计
-      var liveEventsTotal = 0, liveTokensTotal = 0;
+      // 先并行读取所有持久化会话的事件
+      var sessionEventSources = []; // { events: [...] }
+      var readPromises = [];
       for (var i = 0; i < sessionList.length; i++) {
         var rec = sessionList[i];
-        if (!rec || !rec.header || !rec.live) continue;
-        var live = ctx.sessions ? ctx.sessions.get(rec.header.id) : null;
-        if (!live || !live.events || live.events.length === 0) continue;
+        if (!rec || !rec.header) continue;
+        var id = rec.header.id;
 
-        var events = live.events;
-        liveEventsTotal += events.length;
+        if (rec.live) {
+          // 活跃会话：内存 events（同步）
+          var live = ctx.sessions ? ctx.sessions.get(id) : null;
+          sessionEventSources.push({ events: (live && live.events) ? live.events : null });
+        } else if (ctx.sessionPersistence) {
+          // 持久化会话：readFrom 并行
+          (function(sid, arr) {
+            readPromises.push(ctx.sessionPersistence.readFrom(sid, 0).then(function(read) {
+              arr.push({ events: (read && read.events) ? read.events : null });
+            }, function() {
+              arr.push({ events: null });
+            }));
+          })(id, sessionEventSources);
+        }
+      }
+      // 等待所有持久化会话读取完成（保持与 live 会话的顺序一致不重要，结果按天汇总）
+      await Promise.all(readPromises);
+
+      // 统一精确统计每个 assistant/message 事件的 usage
+      for (var s = 0; s < sessionEventSources.length; s++) {
+        var events = sessionEventSources[s].events;
+        if (!events || events.length === 0) continue;
+
         var sessionTokens = 0;
         var dayCnt = {};
-
         for (var j = 0; j < events.length; j++) {
           var ev = events[j];
           if (!ev) continue;
@@ -112,7 +132,6 @@ module.exports = {
             var evTokens = (u.inputTokens || 0) + (u.outputTokens || 0) + (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0);
             if (evTokens > 0) {
               sessionTokens += evTokens;
-              liveTokensTotal += evTokens;
               if (evTime) {
                 var d = new Date(evTime); d.setHours(0, 0, 0, 0);
                 var k = d.getTime();
@@ -126,32 +145,6 @@ module.exports = {
           totalTokens += sessionTokens;
           for (var k in dayCnt) { tokenMap[k] = (tokenMap[k] || 0) + dayCnt[k]; }
         }
-      }
-
-      // 2b. 持久化会话：listEvents 轻量估算
-      var avgPerEvent = liveEventsTotal > 0 ? liveTokensTotal / liveEventsTotal : 0;
-      for (var i = 0; i < sessionList.length; i++) {
-        var rec = sessionList[i];
-        if (!rec || !rec.header || rec.live) continue;
-        try {
-          var evs = ctx.sessionQuery ? await ctx.sessionQuery.listEvents(rec.header.id) : null;
-          if (!evs || evs.length === 0) continue;
-          var dayCnt = {};
-          for (var j = 0; j < evs.length; j++) {
-            if (evs[j] && evs[j].time) {
-              var d = new Date(evs[j].time); d.setHours(0, 0, 0, 0);
-              var k = d.getTime();
-              dayCnt[k] = (dayCnt[k] || 0) + 1;
-            }
-          }
-          var estTokens = Math.round(evs.length * avgPerEvent);
-          if (estTokens > 0) {
-            totalTokens += estTokens;
-            for (var k in dayCnt) {
-              tokenMap[k] = (tokenMap[k] || 0) + Math.round(estTokens * dayCnt[k] / evs.length);
-            }
-          }
-        } catch (e) {}
       }
 
       // 峰值 Token = 单日 token 最多的那一天

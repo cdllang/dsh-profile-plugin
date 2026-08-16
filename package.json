@@ -4,7 +4,12 @@
   "description": "DeepSeek Harness 个人主页插件 - 显示使用统计、Token 活动热力图、会话数据等",
   "keywords": ["deepseek-harness", "dsh", "plugin", "profile", "dashboard"],
   "license": "MIT",
-  "author": "",
+  "author": "cdllang",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cdllang/dsh-profile-plugin.git"
+  },
+  "homepage": "https://github.com/cdllang/dsh-profile-plugin",
   "dsh": {
     "client": {
       "inject": ["slots"]
